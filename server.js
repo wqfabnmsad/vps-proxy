@@ -1,11 +1,11 @@
-// SMS Proxy for Taqnyat — runs on a VPS with a static IP that is whitelisted
-// at the provider. Lovable's server functions call THIS service instead of
-// taqnyat.sa directly, so the outbound IP seen by Taqnyat is always the VPS IP.
+// Messaging Proxy — runs on a VPS with a routable/static IP.
+// Lovable's server functions call THIS service when a provider blocks direct
+// outbound connections from the published app runtime.
 //
 // Environment variables:
 //   PROXY_SECRET    (required)  shared secret. Caller must send X-Proxy-Secret.
 //   PORT            (optional)  default 3000
-//   ALLOWED_HOSTS   (optional)  comma-separated upstream hosts. default: api.taqnyat.sa
+//   ALLOWED_HOSTS   (optional)  comma-separated upstream hosts. default: api.taqnyat.sa,smtp.hostinger.com
 //
 // Endpoints:
 //   GET  /health        → { ok: true } (no auth, for Coolify health checks)
@@ -13,13 +13,15 @@
 //                         body: { to: string[], body: string, sender: string, authToken: string }
 //   GET  /sms/balance   → forwards to https://api.taqnyat.sa/account/balance
 //                         header: X-Auth-Token: <bearer>
+//   POST /smtp/send     → sends email through an allowed SMTP host
 
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
+import nodemailer from "nodemailer";
 
 const PROXY_SECRET = process.env.PROXY_SECRET;
 const PORT = Number(process.env.PORT || 3000);
-const ALLOWED_HOSTS = (process.env.ALLOWED_HOSTS || "api.taqnyat.sa")
+const ALLOWED_HOSTS = (process.env.ALLOWED_HOSTS || "api.taqnyat.sa,smtp.hostinger.com")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -53,7 +55,7 @@ app.use("*", async (c, next) => {
   return next();
 });
 
-app.get("/health", (c) => c.json({ ok: true, service: "sms-proxy", time: new Date().toISOString() }));
+app.get("/health", (c) => c.json({ ok: true, service: "messaging-proxy", time: new Date().toISOString() }));
 
 app.post("/sms/send", async (c) => {
   let payload;
@@ -124,6 +126,55 @@ app.post("/sms/verify", async (c) => {
     status: res.status,
     headers: { "Content-Type": res.headers.get("content-type") || "application/json" },
   });
+});
+
+app.post("/smtp/send", async (c) => {
+  let payload;
+  try { payload = await c.req.json(); } catch { return c.json({ ok: false, error: "invalid_json" }, 400); }
+  const smtp = payload?.smtp || {};
+  const message = payload?.message || {};
+  const host = String(smtp.host || "").trim().replace(/^smtp:\/\//i, "").replace(/^smtps:\/\//i, "").replace(/:\d+\/?$/, "").replace(/\/+$/, "");
+  const port = Number(smtp.port || 465) || 465;
+  const secure = typeof smtp.secure === "boolean" ? smtp.secure : port === 465;
+  const user = String(smtp.user || "").trim();
+  const password = String(smtp.password || "");
+  if (!host) return c.json({ ok: false, error: "smtp.host required" }, 400);
+  if (!ALLOWED_HOSTS.includes(host)) return c.json({ ok: false, error: `smtp host not allowed: ${host}` }, 400);
+  if (!user || !password) return c.json({ ok: false, error: "smtp credentials required" }, 400);
+  if (!message.to || !message.subject || (!message.html && !message.text)) {
+    return c.json({ ok: false, error: "message.to, subject and html/text required" }, 400);
+  }
+
+  const transporter = nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    ...(smtp.family ? { family: Number(smtp.family) } : {}),
+    auth: { user, pass: password },
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 30000,
+    requireTLS: port === 587,
+    tls: { servername: host, minVersion: "TLSv1.2" },
+  });
+
+  try {
+    const started = Date.now();
+    const info = await transporter.sendMail({
+      from: message.from,
+      to: Array.isArray(message.to) ? message.to.join(", ") : message.to,
+      subject: message.subject,
+      html: message.html,
+      text: message.text,
+      replyTo: message.replyTo,
+    });
+    console.log(`[smtp/send] host=${host} status=sent accepted=${info.accepted?.length || 0} rejected=${info.rejected?.length || 0} ${Date.now() - started}ms`);
+    return c.json({ ok: true, messageId: info.messageId, accepted: info.accepted || [], rejected: info.rejected || [] });
+  } catch (err) {
+    const message = err?.message || "smtp_send_failed";
+    console.error(`[smtp/send] host=${host} error=${message}`);
+    return c.json({ ok: false, error: message }, 502);
+  }
 });
 
 
