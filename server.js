@@ -160,6 +160,17 @@ app.post("/smtp/send", async (c) => {
 
   try {
     const started = Date.now();
+    // Normalize attachments: accept [{ filename, content (base64 string), contentType }]
+    const attachments = Array.isArray(message.attachments)
+      ? message.attachments
+          .filter((a) => a && a.filename && a.content)
+          .map((a) => ({
+            filename: String(a.filename),
+            content: Buffer.from(String(a.content), "base64"),
+            contentType: a.contentType || "application/octet-stream",
+          }))
+      : undefined;
+
     const info = await transporter.sendMail({
       from: message.from,
       to: Array.isArray(message.to) ? message.to.join(", ") : message.to,
@@ -167,6 +178,7 @@ app.post("/smtp/send", async (c) => {
       html: message.html,
       text: message.text,
       replyTo: message.replyTo,
+      ...(attachments && attachments.length ? { attachments } : {}),
     });
     console.log(`[smtp/send] host=${host} status=sent accepted=${info.accepted?.length || 0} rejected=${info.rejected?.length || 0} ${Date.now() - started}ms`);
     return c.json({ ok: true, messageId: info.messageId, accepted: info.accepted || [], rejected: info.rejected || [] });
